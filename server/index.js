@@ -14,8 +14,12 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
-// MongoDB - Update with your URI if using Atlas
-mongoose.connect('mongodb://127.0.0.1:27017/sws_assessment').then(() => console.log("DB Connected"));
+require('dotenv').config();
+
+// Use the environment variable
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("Cloud DB Connected Successfully! ✅"))
+  .catch(err => console.log("Database connection error: ", err));
 
 // Schemas
 const Document = mongoose.model('Document', new mongoose.Schema({
