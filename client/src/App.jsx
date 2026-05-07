@@ -1,160 +1,333 @@
-import React, { useState, useEffect } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
-import { io } from 'socket.io-client';
-import { Bell, Upload, FileText, CheckCircle } from 'lucide-react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Download,
+  FileText,
+  Loader2,
+  Upload,
+  XCircle,
+} from 'lucide-react';
 import { Toaster, toast } from 'sonner';
+import './App.css';
 
-// Initialize socket outside component to prevent re-connection loops
-const socket = io('http://localhost:5001');
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5001';
+const MAX_FILES_PER_BATCH = 20;
+
+const statusMeta = {
+  pending: { label: 'Pending', icon: FileText },
+  uploading: { label: 'Uploading', icon: Loader2 },
+  complete: { label: 'Complete', icon: CheckCircle2 },
+  failed: { label: 'Failed', icon: XCircle },
+};
+
+const formatBytes = (bytes = 0) => {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+};
+
+const formatDate = (date) =>
+  new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(date));
+
+const getFileKey = (file) =>
+  `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`;
 
 export default function App() {
-  const [uploadingFiles, setUploadingFiles] = useState({}); 
+  const fileInputRef = useRef(null);
   const [documents, setDocuments] = useState([]);
-  const [notifications, setNotifications] = useState([]);
-  const [showNotifs, setShowNotifs] = useState(false);
+  const [queue, setQueue] = useState([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isLoadingDocs, setIsLoadingDocs] = useState(true);
 
-  // Unified useEffect for Initial Load and Socket Listeners
+  const queuedCount = queue.length;
+  const completedCount = useMemo(
+    () => queue.filter((item) => item.status === 'complete').length,
+    [queue]
+  );
+
+  const loadDocuments = async () => {
+    setIsLoadingDocs(true);
+
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/documents`);
+      setDocuments(response.data);
+    } catch {
+      toast.error('Could not load the document list.');
+    } finally {
+      setIsLoadingDocs(false);
+    }
+  };
+
   useEffect(() => {
-    const init = async () => {
-      try {
-        console.log("Fetching initial data from server...");
-        const [docs, notifs] = await Promise.all([
-          axios.get('http://localhost:5001/api/documents'),
-          axios.get('http://localhost:5001/api/notifications')
-        ]);
-        
-        console.log("Documents from DB:", docs.data);
-        console.log("Notifications from DB:", notifs.data);
-        
-        setDocuments(docs.data);
-        setNotifications(notifs.data);
-      } catch (err) {
-        console.error("Connection failed. Check if server is running on port 5001:", err);
-      }
+    let isMounted = true;
+
+    axios
+      .get(`${API_BASE_URL}/api/documents`)
+      .then((response) => {
+        if (isMounted) setDocuments(response.data);
+      })
+      .catch(() => {
+        if (isMounted) toast.error('Could not load the document list.');
+      })
+      .finally(() => {
+        if (isMounted) setIsLoadingDocs(false);
+      });
+
+    return () => {
+      isMounted = false;
     };
-
-    init();
-
-    // Socket Listener for background processing completion
-    socket.on('notification', (n) => {
-      console.log("New real-time notification received:", n);
-      setNotifications(prev => [n, ...prev]);
-      toast.success(n.message);
-      
-      // Auto-refresh the file list when background task finishes
-      axios.get('http://localhost:5001/api/documents')
-        .then(res => {
-          console.log("Refreshing document list after notification...");
-          setDocuments(res.data);
-        });
-    });
-
-    return () => socket.off('notification');
   }, []);
 
-  const handleUpload = async (e) => {
-    const files = Array.from(e.target.files);
-    if (files.length === 0) return;
+  const setFileState = (id, update) => {
+    setQueue((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...update } : item))
+    );
+  };
 
-    if (files.length > 3) {
-      toast.info(`Processing ${files.length} files in background...`);
+  const uploadFile = async (item) => {
+    const formData = new FormData();
+    formData.append('files', item.file);
+
+    setFileState(item.id, { status: 'uploading', progress: 0, error: '' });
+
+    try {
+      const response = await axios.post(`${API_BASE_URL}/api/upload`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        onUploadProgress: (event) => {
+          if (!event.total) return;
+          const progress = Math.min(99, Math.round((event.loaded * 100) / event.total));
+          setFileState(item.id, { progress });
+        },
+      });
+
+      setFileState(item.id, { status: 'complete', progress: 100 });
+      setDocuments((current) => [...response.data.documents, ...current]);
+    } catch (err) {
+      const message = err.response?.data?.error || 'Upload failed.';
+      setFileState(item.id, { status: 'failed', progress: 100, error: message });
+      toast.error(`${item.file.name}: ${message}`);
+    }
+  };
+
+  const handleFiles = (fileList) => {
+    const selectedFiles = Array.from(fileList || []);
+    if (selectedFiles.length === 0) return;
+
+    const pdfFiles = selectedFiles.filter(
+      (file) => file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+    );
+    const rejectedCount = selectedFiles.length - pdfFiles.length;
+
+    if (rejectedCount > 0) {
+      toast.error(`${rejectedCount} non-PDF file${rejectedCount > 1 ? 's were' : ' was'} skipped.`);
     }
 
-    files.forEach(async (file) => {
-      const formData = new FormData();
-      formData.append('files', file);
+    if (pdfFiles.length === 0) return;
 
-      try {
-        console.log(`Starting upload for: ${file.name}`);
-        await axios.post('http://localhost:5001/api/upload', formData, {
-          onUploadProgress: (p) => {
-            const percent = Math.round((p.loaded * 100) / p.total);
-            setUploadingFiles(prev => ({ ...prev, [file.name]: percent }));
-          }
-        });
-        
-        console.log(`Upload complete for: ${file.name}`);
+    const uploadItems = pdfFiles.slice(0, MAX_FILES_PER_BATCH).map((file) => ({
+      id: getFileKey(file),
+      file,
+      progress: 0,
+      status: 'pending',
+      error: '',
+    }));
 
-        // Remove individual progress bar after completion
-        setTimeout(() => {
-          setUploadingFiles(prev => {
-            const next = { ...prev };
-            delete next[file.name];
-            return next;
-          });
-          
-          // Refresh list for single or small uploads
-          axios.get('http://localhost:5001/api/documents').then(res => setDocuments(res.data));
-        }, 1500);
-      } catch (err) {
-        console.error(`Upload error for ${file.name}:`, err);
-        toast.error(`Error uploading ${file.name}`);
-      }
-    });
+    if (pdfFiles.length > MAX_FILES_PER_BATCH) {
+      toast.info(`Only the first ${MAX_FILES_PER_BATCH} PDFs were queued.`);
+    }
+
+    setQueue((current) => [...uploadItems, ...current]);
+    uploadItems.forEach(uploadFile);
+  };
+
+  const handleInputChange = (event) => {
+    handleFiles(event.target.files);
+    event.target.value = '';
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setIsDragging(false);
+    handleFiles(event.dataTransfer.files);
   };
 
   return (
-    <div className="container">
+    <main className="page-shell">
       <Toaster richColors position="top-right" />
-      
-      <header className="header">
-        <h1 style={{ color: '#2563eb' }}>SWS Dashboard</h1>
-        <div style={{ position: 'relative', cursor: 'pointer' }} onClick={() => setShowNotifs(!showNotifs)}>
-          <Bell size={28} />
-          {notifications.length > 0 && <span className="notif-badge">{notifications.length}</span>}
+
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">Document center</p>
+          <h1>PDF uploads</h1>
         </div>
+        <button className="secondary-action" type="button" onClick={loadDocuments}>
+          Refresh list
+        </button>
       </header>
 
-      {showNotifs && (
-        <div className="notif-panel">
-          <h3 style={{ margin: '0 0 10px 0', fontSize: '14px' }}>Updates</h3>
-          {notifications.length === 0 && <p style={{ fontSize: '12px' }}>No updates yet.</p>}
-          {notifications.map((n, i) => (
-            <div key={i} className="notif-item">{n.message}</div>
-          ))}
+      <section
+        className={`dropzone ${isDragging ? 'dropzone-active' : ''}`}
+        onClick={() => fileInputRef.current?.click()}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={handleDrop}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') fileInputRef.current?.click();
+        }}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          multiple
+          onChange={handleInputChange}
+          hidden
+        />
+        <div className="dropzone-icon">
+          <Upload size={28} />
         </div>
-      )}
-
-      <div className="upload-card" onClick={() => document.getElementById('fileInput').click()}>
-        <Upload size={40} color="#2563eb" />
-        <p style={{ fontWeight: '600' }}>Click to upload PDF documents</p>
-        <input id="fileInput" type="file" multiple hidden accept=".pdf" onChange={handleUpload} />
-      </div>
-
-      <div style={{ marginTop: '20px' }}>
-        {Object.entries(uploadingFiles).map(([name, progress]) => (
-          <div key={name} style={{ marginBottom: '10px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px' }}>
-              <span>{name}</span>
-              <span>{progress}%</span>
-            </div>
-            <div className="progress-bar-container">
-              <div className="progress-fill" style={{ width: `${progress}%` }}></div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <section style={{ marginTop: '40px' }}>
-        <h2>Recent Files</h2>
-        <table>
-          <thead>
-            <tr><th>File Name</th><th>Status</th></tr>
-          </thead>
-          <tbody>
-            {documents.length === 0 ? (
-              <tr><td colSpan="2" style={{ textAlign: 'center', padding: '20px' }}>No files uploaded yet.</td></tr>
-            ) : (
-              documents.map(doc => (
-                <tr key={doc._id}>
-                  <td>{doc.name}</td>
-                  <td><span className="badge">Success</span></td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+        <div>
+          <h2>Select or drop PDF files</h2>
+          <p>Upload one file or a bulk batch. Each file is tracked individually.</p>
+        </div>
       </section>
-    </div>
+
+      <section className="upload-panel" aria-live="polite">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Current batch</p>
+            <h2>Upload progress</h2>
+          </div>
+          {queuedCount > 0 && (
+            <span className="count-pill">
+              {completedCount}/{queuedCount} complete
+            </span>
+          )}
+        </div>
+
+        {queue.length === 0 ? (
+          <div className="empty-state">
+            <FileText size={24} />
+            <span>No active uploads yet.</span>
+          </div>
+        ) : (
+          <div className="upload-list">
+            {queue.map((item) => {
+              const StatusIcon = statusMeta[item.status].icon;
+              return (
+                <article className="upload-item" key={item.id}>
+                  <div className="file-icon">
+                    <FileText size={22} />
+                  </div>
+                  <div className="file-main">
+                    <div className="file-row">
+                      <div>
+                        <h3>{item.file.name}</h3>
+                        <p>
+                          {formatBytes(item.file.size)} · {item.file.type || 'application/pdf'}
+                        </p>
+                      </div>
+                      <span className={`status-badge status-${item.status}`}>
+                        <StatusIcon size={16} className={item.status === 'uploading' ? 'spin' : ''} />
+                        {statusMeta[item.status].label}
+                      </span>
+                    </div>
+                    <div className="progress-track" aria-label={`${item.file.name} upload progress`}>
+                      <div className="progress-fill" style={{ width: `${item.progress}%` }} />
+                    </div>
+                    <div className="progress-meta">
+                      <span>{item.error || `${item.progress}% uploaded`}</span>
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <section className="documents-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Stored files</p>
+            <h2>Document list</h2>
+          </div>
+        </div>
+
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Type</th>
+                <th>Upload date</th>
+                <th>Download</th>
+              </tr>
+            </thead>
+            <tbody>
+              {isLoadingDocs ? (
+                <tr>
+                  <td colSpan="5" className="table-empty">
+                    Loading documents...
+                  </td>
+                </tr>
+              ) : documents.length === 0 ? (
+                <tr>
+                  <td colSpan="5" className="table-empty">
+                    No files uploaded yet.
+                  </td>
+                </tr>
+              ) : (
+                documents.map((doc) => (
+                  <tr key={doc._id}>
+                    <td>
+                      <div className="doc-name">
+                        <FileText size={18} />
+                        <span>{doc.name}</span>
+                      </div>
+                    </td>
+                    <td>{formatBytes(doc.size)}</td>
+                    <td>{doc.type || 'application/pdf'}</td>
+                    <td>{formatDate(doc.uploadDate)}</td>
+                    <td>
+                      {doc.downloadUrl ? (
+                        <a
+                          className="download-link"
+                          href={`${API_BASE_URL}${doc.downloadUrl}`}
+                          download
+                          aria-label={`Download ${doc.name}`}
+                        >
+                          <Download size={18} />
+                        </a>
+                      ) : (
+                        <span className="download-missing">Unavailable</span>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div className="note-row">
+        <AlertCircle size={16} />
+        <span>PDF only. Maximum 25 MB per file, up to 20 files per batch.</span>
+      </div>
+    </main>
   );
 }
